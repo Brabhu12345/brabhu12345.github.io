@@ -1,0 +1,249 @@
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI Robotic Finger</title>
+
+<style>
+  body {
+    margin: 0;
+    padding: 18px;
+    background: #10131b;
+    color: white;
+    font-family: Arial, sans-serif;
+    text-align: center;
+  }
+
+  h2 { color: #55e6a5; }
+
+  .screen {
+    position: relative;
+    width: 100%;
+    max-width: 640px;
+    margin: 15px auto;
+  }
+
+  video, canvas {
+    width: 100%;
+    border-radius: 12px;
+  }
+
+  video {
+    display: block;
+    transform: scaleX(-1);
+  }
+
+  canvas {
+    position: absolute;
+    inset: 0;
+    height: 100%;
+    pointer-events: none;
+  }
+
+  button {
+    background: #55e6a5;
+    color: #10131b;
+    border: 0;
+    border-radius: 9px;
+    padding: 13px 20px;
+    font-size: 16px;
+    font-weight: bold;
+  }
+
+  #status, #bend {
+    margin: 12px;
+    overflow-wrap: anywhere;
+  }
+</style>
+</head>
+
+<body>
+<h2>AI Robotic Finger 🤖</h2>
+<p>Show your index finger to the camera.</p>
+
+<button id="startButton">Start AI Camera</button>
+
+<div class="screen">
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="canvas"></canvas>
+</div>
+
+<div id="status">Status: Waiting to start</div>
+<div id="bend">Finger bend: --</div>
+<div id="connection">NodeMCU: Waiting</div>
+
+<script type="module">
+import {
+  FilesetResolver,
+  HandLandmarker
+} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+// This must match the IP shown in your NodeMCU Serial Monitor.
+const ESP_IP = "http://192.168.1.104";
+
+const video = document.getElementById("video");
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+
+const statusText = document.getElementById("status");
+const bendText = document.getElementById("bend");
+const connectionText = document.getElementById("connection");
+const startButton = document.getElementById("startButton");
+
+let tracker;
+let lastVideoTime = -1;
+let lastSentTime = 0;
+let lastBendSent = -1;
+let running = false;
+
+function angle(a, b, c) {
+  const abx = a.x - b.x;
+  const aby = a.y - b.y;
+  const cbx = c.x - b.x;
+  const cby = c.y - b.y;
+
+  const dot = abx * cbx + aby * cby;
+  const mag1 = Math.hypot(abx, aby);
+  const mag2 = Math.hypot(cbx, cby);
+
+  if (mag1 === 0 || mag2 === 0) return 180;
+
+  const cosine = Math.max(-1, Math.min(1, dot / (mag1 * mag2)));
+  return Math.acos(cosine) * 180 / Math.PI;
+}
+
+function drawFinger(points) {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  const ids = [0, 5, 6, 7, 8];
+
+  ctx.lineWidth = 5;
+  ctx.strokeStyle = "#55e6a5";
+  ctx.fillStyle = "#ffdf5d";
+
+  ctx.beginPath();
+  ids.forEach((id, index) => {
+    const p = points[id];
+    const x = (1 - p.x) * canvas.width;
+    const y = p.y * canvas.height;
+
+    if (index === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+
+  for (const id of ids) {
+    const p = points[id];
+    const x = (1 - p.x) * canvas.width;
+    const y = p.y * canvas.height;
+
+    ctx.beginPath();
+    ctx.arc(x, y, 7, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+async function sendBend(bend) {
+  const now = performance.now();
+
+  // Limit requests so the NodeMCU is not flooded.
+  if (now - lastSentTime < 80 && bend === lastBendSent) return;
+  if (now - lastSentTime < 80) return;
+
+  lastSentTime = now;
+  lastBendSent = bend;
+
+  try {
+    await fetch(ESP_IP + "/angle", {
+      method: "POST",
+      headers: { "Content-Type": "text/plain" },
+      body: String(bend)
+    });
+
+    connectionText.textContent = "NodeMCU: Command sent ✅";
+  } catch (error) {
+    connectionText.textContent =
+      "NodeMCU: Cannot connect. Check Wi-Fi/IP.";
+  }
+}
+
+async function runAI() {
+  if (!running) return;
+
+  if (video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+
+    const result = tracker.detectForVideo(video, performance.now());
+
+    if (result.landmarks && result.landmarks.length > 0) {
+      const points = result.landmarks[0];
+
+      drawFinger(points);
+
+      // Estimate bend from the index finger's three joints.
+      const mcpBend = 180 - angle(points[0], points[5], points[6]);
+      const pipBend = 180 - angle(points[5], points[6], points[7]);
+      const dipBend = 180 - angle(points[6], points[7], points[8]);
+
+      let bend = Math.round((mcpBend + pipBend + dipBend) / 3);
+      bend = Math.max(0, Math.min(120, bend));
+
+      bendText.textContent = "Finger bend: " + bend + "°";
+      statusText.textContent = "Status: Hand detected ✅";
+
+      await sendBend(bend);
+    } else {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      statusText.textContent = "Status: Show your hand to camera";
+    }
+  }
+
+  requestAnimationFrame(runAI);
+}
+
+startButton.addEventListener("click", async () => {
+  startButton.disabled = true;
+  statusText.textContent = "Loading AI model...";
+
+  try {
+    const vision = await FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+    );
+
+    tracker = await HandLandmarker.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath:
+          "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+        delegate: "CPU"
+      },
+      runningMode: "VIDEO",
+      numHands: 1
+    });
+
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: "user",
+        width: { ideal: 640 },
+        height: { ideal: 480 }
+      },
+      audio: false
+    });
+
+    video.srcObject = stream;
+    await video.play();
+
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+
+    running = true;
+    statusText.textContent = "Status: AI running";
+    startButton.textContent = "AI Running";
+    runAI();
+
+  } catch (error) {
+    console.error(error);
+    statusText.textContent = "Error: " + error.message;
+    startButton.disabled = false;
+  }
+});
+</script>
+</body>
